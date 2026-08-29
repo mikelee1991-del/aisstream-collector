@@ -1,0 +1,139 @@
+name: aisstream live collect
+
+# Public repo → free GitHub Actions minutes. Single websocket at a time
+# (free aisstream.io rejects overlaps with HTTP 429). Cron every 5h cancels
+# the previous run and starts a fresh session. Shards land on Release tag
+# aisstream-live for private FishScraper ingest to merge.
+
+on:
+  schedule:
+    - cron: "15 */5 * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/aisstream-collect.yml"
+      - "scripts/collect_aisstream.py"
+      - "scripts/config.py"
+      - "deploy/accepted_names.json"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Hours to collect this run (0 = until cancelled / 6h job cap)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aisstream-collect
+  cancel-in-progress: true
+
+env:
+  LIVE_RELEASE: aisstream-live
+  AISSTREAM_HOST: github-actions-public
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check AISSTREAM_API_KEY
+        id: key
+        env:
+          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AISSTREAM_API_KEY}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Add repo secret AISSTREAM_API_KEY (https://aisstream.io/ → API Keys). Collection skipped."
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "::error::AISSTREAM_API_KEY is not set."
+              exit 1
+            fi
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: ${{ steps.key.outputs.present == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install collector dependencies
+        if: ${{ steps.key.outputs.present == 'true' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Collect live AIS
+        id: collect
+        if: ${{ steps.key.outputs.present == 'true' }}
+        env:
+          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+        run: |
+          set -euo pipefail
+          HOURS="${{ github.event.inputs.hours }}"
+          HOURS="${HOURS:-0}"
+          mkdir -p data/processed/ais_live docs/data
+          python3 scripts/collect_aisstream.py \
+            --hours "$HOURS" \
+            --flush-every 200 \
+            --fail-if-empty \
+            --empty-abort-after 1200 \
+            --accepted-names deploy/accepted_names.json \
+            --out-dir data/processed/ais_live \
+            --status-out docs/data/aisstream_status.json
+          shopt -s nullglob
+          files=(data/processed/ais_live/ais_*.parquet)
+          echo "n_files=${#files[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload live shards to Release
+        if: ${{ always() && steps.key.outputs.present == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES="Rolling aisstream.io live shards (fleet + SoCal bbox).
+          Consumed by private mikelee1991-del/FishScraper ingest.
+          Do not edit by hand."
+          if ! gh release view "$LIVE_RELEASE" >/dev/null 2>&1; then
+            gh release create "$LIVE_RELEASE" \
+              --title "aisstream live shards" \
+              --notes "$NOTES"
+          fi
+          shopt -s nullglob
+          for f in data/processed/ais_live/ais_*.parquet; do
+            base=$(basename "$f")
+            dest="live-${GITHUB_RUN_ID}-${base}"
+            cp "$f" "$dest"
+            gh release upload "$LIVE_RELEASE" "$dest" --clobber
+            echo "uploaded $dest"
+          done
+          if [ -f docs/data/aisstream_status.json ]; then
+            cp docs/data/aisstream_status.json status.json
+            gh release upload "$LIVE_RELEASE" status.json --clobber
+          fi
+
+      - name: Commit collector status
+        if: ${{ always() && steps.key.outputs.present == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ ! -f docs/data/aisstream_status.json ]; then
+            echo "No status file."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/data/aisstream_status.json
+          if git diff --cached --quiet; then
+            echo "Status unchanged."
+            exit 0
+          fi
+          git commit -m "chore: update aisstream collector status"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || git pull --rebase origin main || true
+          git push || git push origin "HEAD:${GITHUB_REF_NAME}"
