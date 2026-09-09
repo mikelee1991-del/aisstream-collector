@@ -17,6 +17,13 @@ on:
       - "scripts/config.py"
       - "scripts/upload_live_shards.sh"
       - "deploy/accepted_names.json"
+  pull_request:
+    paths:
+      - ".github/workflows/aisstream-collect.yml"
+      - "scripts/collect_aisstream.py"
+      - "scripts/config.py"
+      - "scripts/upload_live_shards.sh"
+      - "deploy/accepted_names.json"
   workflow_dispatch:
     inputs:
       hours:
@@ -97,6 +104,9 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             HOURS="${{ github.event.inputs.hours }}"
             HOURS="${HOURS:-0}"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Short live smoke so PRs prove collect+upload without a 4h wait.
+            HOURS="0.05"
           else
             HOURS="${SCHEDULE_HOURS}"
           fi
