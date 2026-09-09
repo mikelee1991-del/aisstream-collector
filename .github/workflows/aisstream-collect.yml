@@ -1,8 +1,9 @@
 name: aisstream live collect
 
 # Public repo → free GitHub Actions minutes. Single websocket at a time
-# (free aisstream.io rejects overlaps with HTTP 429). Cron every 5h cancels
-# the previous run and starts a fresh session. Shards land on Release tag
+# (free aisstream.io rejects overlaps with HTTP 429). Scheduled runs collect
+# for a bounded window then exit green. cancel-in-progress still handoffs
+# overlapping dispatch/late-cron sessions. Shards land on Release tag
 # aisstream-live for private FishScraper ingest to merge.
 
 on:
@@ -14,11 +15,12 @@ on:
       - ".github/workflows/aisstream-collect.yml"
       - "scripts/collect_aisstream.py"
       - "scripts/config.py"
+      - "scripts/upload_live_shards.sh"
       - "deploy/accepted_names.json"
   workflow_dispatch:
     inputs:
       hours:
-        description: "Hours to collect this run (0 = until cancelled / 6h job cap)"
+        description: "Hours to collect this run (0 = until cancelled / step timeout)"
         required: false
         default: "0"
 
@@ -32,6 +34,9 @@ concurrency:
 env:
   LIVE_RELEASE: aisstream-live
   AISSTREAM_HOST: github-actions-public
+  # Finish before the 5h cron and before hosted-runner preemption (~4.5h)
+  # that marked run 34336864840 as failure after skipping always() upload.
+  SCHEDULE_HOURS: "4"
 
 jobs:
   collect:
@@ -72,14 +77,33 @@ jobs:
 
       - name: Collect live AIS
         id: collect
+        # Step timeout (not job timeout) so always() upload can still run.
+        timeout-minutes: 300
         if: ${{ steps.key.outputs.present == 'true' }}
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          HOURS="${{ github.event.inputs.hours }}"
-          HOURS="${HOURS:-0}"
+          # GitHub SIGTERMs the process group on cancel/preempt. Trap it in
+          # bash so we survive long enough for Python to flush and for us to
+          # upload. Run 34336864840 flushed 205 rows then skipped always()
+          # upload, concluding failure and emailing "Run failed".
+          on_term() {
+            echo "step received SIGTERM; waiting for collector flush + upload…"
+          }
+          trap on_term TERM INT
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            HOURS="${{ github.event.inputs.hours }}"
+            HOURS="${HOURS:-0}"
+          else
+            HOURS="${SCHEDULE_HOURS}"
+          fi
+          echo "collect hours=${HOURS} event=${{ github.event_name }}"
+
           mkdir -p data/processed/ais_live docs/data
+          collect_rc=0
           python3 scripts/collect_aisstream.py \
             --hours "$HOURS" \
             --flush-every 200 \
@@ -87,10 +111,24 @@ jobs:
             --empty-abort-after 1200 \
             --accepted-names deploy/accepted_names.json \
             --out-dir data/processed/ais_live \
-            --status-out docs/data/aisstream_status.json
+            --status-out docs/data/aisstream_status.json \
+            || collect_rc=$?
+
+          if ! bash scripts/upload_live_shards.sh \
+            data/processed/ais_live \
+            docs/data/aisstream_status.json; then
+            echo "::warning::in-step shard upload failed; always() step may retry"
+          fi
+
           shopt -s nullglob
           files=(data/processed/ais_live/ais_*.parquet)
           echo "n_files=${#files[@]}" >> "$GITHUB_OUTPUT"
+
+          # 143 = 128+SIGTERM if Python did not install a handler.
+          if [ "$collect_rc" -eq 0 ] || [ "$collect_rc" -eq 143 ]; then
+            exit 0
+          fi
+          exit "$collect_rc"
 
       - name: Upload live shards to Release
         if: ${{ always() && steps.key.outputs.present == 'true' }}
@@ -98,26 +136,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          NOTES="Rolling aisstream.io live shards (fleet + SoCal bbox).
-          Consumed by private mikelee1991-del/FishScraper ingest.
-          Do not edit by hand."
-          if ! gh release view "$LIVE_RELEASE" >/dev/null 2>&1; then
-            gh release create "$LIVE_RELEASE" \
-              --title "aisstream live shards" \
-              --notes "$NOTES"
-          fi
-          shopt -s nullglob
-          for f in data/processed/ais_live/ais_*.parquet; do
-            base=$(basename "$f")
-            dest="live-${GITHUB_RUN_ID}-${base}"
-            cp "$f" "$dest"
-            gh release upload "$LIVE_RELEASE" "$dest" --clobber
-            echo "uploaded $dest"
-          done
-          if [ -f docs/data/aisstream_status.json ]; then
-            cp docs/data/aisstream_status.json status.json
-            gh release upload "$LIVE_RELEASE" status.json --clobber
-          fi
+          bash scripts/upload_live_shards.sh \
+            data/processed/ais_live \
+            docs/data/aisstream_status.json
 
       - name: Commit collector status
         if: ${{ always() && steps.key.outputs.present == 'true' }}

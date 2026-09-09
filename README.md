@@ -18,6 +18,9 @@ FishScraper stays **private**. This repo is **public** so the long-running `aiss
    - Value: key from [aisstream.io](https://aisstream.io/) → API Keys (same key FishScraper used)
 2. Enable Actions if prompted.
 3. **Actions → aisstream live collect → Run workflow** (or wait for the 5h cron).
+   Scheduled runs collect for 4 hours then upload and exit green. Manual
+   `hours=0` still runs until cancelled; shards are uploaded in the collect
+   step so a runner SIGTERM cannot skip the Release publish.
 
 ## Sync boat list from FishScraper
 
