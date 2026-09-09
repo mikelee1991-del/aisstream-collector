@@ -150,21 +150,6 @@ jobs:
             data/processed/ais_live \
             docs/data/aisstream_status.json
 
-      - name: Commit collector status
-        if: ${{ always() && steps.key.outputs.present == 'true' }}
-        run: |
-          set -euo pipefail
-          if [ ! -f docs/data/aisstream_status.json ]; then
-            echo "No status file."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/data/aisstream_status.json
-          if git diff --cached --quiet; then
-            echo "Status unchanged."
-            exit 0
-          fi
-          git commit -m "chore: update aisstream collector status"
-          git pull --rebase origin "${GITHUB_REF_NAME}" || git pull --rebase origin main || true
-          git push || git push origin "HEAD:${GITHUB_REF_NAME}"
+      # Status is the Release asset status.json (FishScraper ingest).
+      # Do not commit docs/data/ — it is gitignored, and `git add` of an
+      # ignored path exits 1 (failed run 34364047651 after a good upload).
