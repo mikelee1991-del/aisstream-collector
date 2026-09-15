@@ -1,15 +1,29 @@
 name: aisstream live collect
 
-# Paused to save Actions minutes. Re-enable schedule when minutes recover.
-# Manual Run workflow (workflow_dispatch) is still allowed.
-#
 # Public repo → free GitHub Actions minutes. Single websocket at a time
-# (free aisstream.io rejects overlaps with HTTP 429). When re-enabled,
-# scheduled runs collect for a bounded window then exit green.
-# cancel-in-progress still handoffs overlapping dispatch sessions.
-# Shards land on Release tag aisstream-live for private FishScraper ingest.
+# (free aisstream.io rejects overlaps with HTTP 429). Scheduled runs collect
+# for a bounded window then exit green. cancel-in-progress still handoffs
+# overlapping dispatch/late-cron sessions. Shards land on Release tag
+# aisstream-live for private FishScraper ingest to merge.
 
 on:
+  schedule:
+    - cron: "15 */5 * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/aisstream-collect.yml"
+      - "scripts/collect_aisstream.py"
+      - "scripts/config.py"
+      - "scripts/upload_live_shards.sh"
+      - "deploy/accepted_names.json"
+  pull_request:
+    paths:
+      - ".github/workflows/aisstream-collect.yml"
+      - "scripts/collect_aisstream.py"
+      - "scripts/config.py"
+      - "scripts/upload_live_shards.sh"
+      - "deploy/accepted_names.json"
   workflow_dispatch:
     inputs:
       hours:
