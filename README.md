@@ -33,6 +33,8 @@ On time, that is **15 hours of collection, about 910 runner-minutes per day** (9
 
 Boats already offshore at the start are picked up when the 5:00 AM PDT / 4:00 AM PST run connects. Twilight boats still out after 8:00 PM PDT / 7:00 PM PST are outside this window.
 
+A vessel of interest sitting overnight — already offshore, or overnighting on the water, while collection is off — is not recorded until the morning window starts again. Overnight collection is off on purpose (roughly 8:00 PM–5:00 AM Pacific). That timing may change later; this note only records the limitation.
+
 A stuck run is capped at 340 minutes for the collect step and 360 minutes for the job (the hosted-runner maximum). PR runs stay a short smoke test (`hours=0.05`, about 3 minutes). **Actions → aisstream live collect → Run workflow** defaults to one 5.25-hour segment. `hours=0` runs until you cancel it or the step timeout fires. One manual job cannot hold the full fishing day; that takes the three scheduled runs.
 
 ## Vessels of interest
