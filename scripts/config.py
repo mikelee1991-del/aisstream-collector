@@ -1,7 +1,11 @@
 """Minimal config for the public aisstream collector.
 
-Keep AIS_BBOX / MMSI maps in sync with FishScraper's scripts/config.py when
-those change. deploy/accepted_names.json is the primary boat-name filter.
+AIS_BBOX plus these MMSI maps are unioned with deploy/accepted_names.json
+(accepted_names, mmsi_allowlist, mmsi_to_report_boat). The collector
+subscribes with FiltersShipMMSI — not every ship in the bbox.
+
+Keep this file in sync with FishScraper's scripts/config.py when those maps
+change. See README "Sync boat list from FishScraper".
 """
 
 from __future__ import annotations

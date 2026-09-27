@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Collect live SoCal AIS from free aisstream.io websocket into daily parquet.
+"""Collect live SoCal AIS for FishScraper vessels of interest.
 
-This is the free forward-looking alternative while Marine Cadastre 2026 bulk
-files are unpublished. aisstream has NO historical backfill API — it only
-streams live messages. Run continuously (or on a host with long sessions)
-to build our own archive.
+aisstream has no historical backfill — it only streams live messages.
+The websocket subscription is the SoCal bbox plus FiltersShipMMSI built
+from deploy/accepted_names.json and the MMSI maps in scripts/config.py.
+aisstream has no ship-name subscribe filter (MMSI list, max 200). Rows are
+recorded only when the MMSI is on that allowlist or the normalized AIS name
+is in accepted_names. Anything else is dropped and is not written.
 
 Setup:
   1. Create a free API key at https://aisstream.io/ (GitHub login)
   2. export AISSTREAM_API_KEY=...
-  3. python3 scripts/collect_aisstream.py --hours 0   # 0 = run forever
+  3. python3 scripts/collect_aisstream.py --hours 0.75
 
 Primary host is a single GitHub Actions session at a time
 (.github/workflows/aisstream-collect.yml). Overlapping sockets get HTTP 429
 from the free tier, so the workflow cancels the previous run on handoff.
-Optional always-on VM: deploy/aisstream/README.md.
 
-Output lands in data/processed/ais_daily/ais_YYYY-MM-DD.parquet with schema
-compatible with detect_stops.py (plus ais_source='aisstream'). Same-day
-restarts append and dedupe so rolling jobs do not wipe earlier hours.
+Output is daily parquet (ais_YYYY-MM-DD.parquet) under --out-dir. The
+workflow uses data/processed/ais_live/. The local default is
+data/processed/ais_daily/. Same-day restarts append and dedupe.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import signal
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -46,10 +48,87 @@ from config import (  # noqa: E402
 )
 
 NAME_NORMALIZE_RE = re.compile(r"[^A-Z0-9]+")
+# aisstream FiltersShipMMSI: up to 200 nine-character MMSI strings.
+AISSTREAM_MAX_MMSI_FILTERS = 200
+POSITION_MESSAGE_TYPES = [
+    "PositionReport",
+    "StandardClassBPositionReport",
+    "ExtendedClassBPositionReport",
+    "ShipStaticData",
+]
 
 
 def normalize_name(name: str) -> str:
     return NAME_NORMALIZE_RE.sub("", (name or "").upper())
+
+
+def format_subscription_mmsi(mmsi: int) -> str | None:
+    """Return a nine-character MMSI, or None if aisstream would reject it."""
+    if isinstance(mmsi, bool) or not isinstance(mmsi, int):
+        return None
+    if mmsi < 100_000_000 or mmsi > 999_999_999:
+        return None
+    return str(mmsi)
+
+
+def _coerce_mmsi(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+@dataclass(frozen=True)
+class FleetFilter:
+    """Vessels of interest from accepted names plus MMSI maps.
+
+    Subscription is MMSI-only. Recording also keeps an accepted-name match
+    so a message that arrives for a listed boat is not dropped.
+    """
+
+    accepted_names: dict[str, str]
+    mmsi_to_report_boat: dict[int, str]
+    mmsi_allowlist: set[int]
+
+    def subscribe_mmsis(self) -> list[str]:
+        raw = set(self.mmsi_allowlist) | set(self.mmsi_to_report_boat)
+        formatted: list[str] = []
+        skipped: list[int] = []
+        for mmsi in sorted(raw):
+            text = format_subscription_mmsi(mmsi)
+            if text is None:
+                skipped.append(mmsi)
+                continue
+            formatted.append(text)
+        if skipped:
+            print(
+                f"[warn] skipping {len(skipped)} MMSI(s) that are not 9 digits: "
+                f"{skipped[:10]}",
+                flush=True,
+            )
+        if len(formatted) > AISSTREAM_MAX_MMSI_FILTERS:
+            print(
+                f"[warn] MMSI allowlist has {len(formatted)}; aisstream allows "
+                f"{AISSTREAM_MAX_MMSI_FILTERS}. Subscribing to the first "
+                f"{AISSTREAM_MAX_MMSI_FILTERS} sorted MMSIs.",
+                flush=True,
+            )
+            formatted = formatted[:AISSTREAM_MAX_MMSI_FILTERS]
+        return formatted
+
+    def match(self, mmsi: int, norm: str) -> tuple[bool, str | None]:
+        """Return (keep, report boat name). Name may be None for MMSI-only hits."""
+        report = self.mmsi_to_report_boat.get(mmsi) or (
+            self.accepted_names.get(norm) if norm else None
+        )
+        if report is None and mmsi not in self.mmsi_allowlist and norm not in self.accepted_names:
+            return False, None
+        return True, report or None
 
 def _ws_connect():
     try:
@@ -60,7 +139,7 @@ def _ws_connect():
 
 WS_URL = "wss://stream.aisstream.io/v0/stream"
 OUT_DIR = DATA_PROCESSED / "ais_daily"
-DEFAULT_ACCEPTED = ROOT / "deploy" / "aisstream" / "accepted_names.json"
+DEFAULT_ACCEPTED = ROOT / "deploy" / "accepted_names.json"
 
 # Free-tier aisstream rejects concurrent sockets with HTTP 429. Back off hard
 # so overlapping/zombie sessions can clear instead of reconnect-storming.
@@ -68,8 +147,8 @@ RECONNECT_BASE_SEC = 5.0
 RECONNECT_MAX_SEC = 60.0
 RATE_LIMIT_BASE_SEC = 30.0
 RATE_LIMIT_MAX_SEC = 900.0
-# Scheduled/GHA sessions: bail early when the stream never delivers (don't burn
-# a full 5h job on a dead/rate-limited key).
+# Bail early when the stream never delivers so a dead key does not burn the
+# rest of the collect window.
 EMPTY_ABORT_AFTER_SEC = 20 * 60
 
 _stop = False
@@ -117,22 +196,105 @@ def bbox_for_aisstream() -> list[list[list[float]]]:
     ]]
 
 
-def load_accepted_names(path: Path | None, trips_path: Path) -> dict[str, str]:
-    """Prefer a small JSON mapping (VM-friendly); fall back to fish-report trips."""
-    if path and path.exists():
+def _accepted_names_from_payload(payload: object) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        raise SystemExit("accepted names JSON must be an object")
+    if "accepted_names" in payload:
+        raw = payload.get("accepted_names") or {}
+    else:
+        raw = {
+            key: value
+            for key, value in payload.items()
+            if isinstance(value, str) and key != "description"
+        }
+    if not isinstance(raw, dict):
+        raise SystemExit("accepted_names must be an object")
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+def _mmsi_maps_from_payload(payload: dict) -> tuple[set[int], dict[int, str]]:
+    allow: set[int] = set()
+    names: dict[int, str] = {}
+    raw_allow = payload.get("mmsi_allowlist") or []
+    if isinstance(raw_allow, list):
+        for item in raw_allow:
+            mmsi = _coerce_mmsi(item)
+            if mmsi is not None:
+                allow.add(mmsi)
+    raw_names = payload.get("mmsi_to_report_boat") or {}
+    if isinstance(raw_names, dict):
+        for key, boat in raw_names.items():
+            mmsi = _coerce_mmsi(key)
+            if mmsi is None:
+                continue
+            names[mmsi] = str(boat)
+            allow.add(mmsi)
+    return allow, names
+
+
+def load_fleet_filter(path: Path | None, trips_path: Path) -> FleetFilter:
+    """Union config.py MMSI maps with deploy/accepted_names.json.
+
+    JSON boat names overlay config.py when both name the same MMSI. MMSIs are
+    unioned so a boat listed in only one file is still subscribed.
+    """
+    mmsi_allow = set(MMSI_ALLOWLIST)
+    mmsi_names = dict(MMSI_TO_REPORT_BOAT)
+    accepted: dict[str, str] = {}
+    source = "scripts/config.py"
+    if path is not None:
+        if not path.exists():
+            raise SystemExit(f"accepted names file not found: {path}")
         payload = json.loads(path.read_text())
-        raw = payload.get("accepted_names") or payload
-        out = {str(k): str(v) for k, v in raw.items()}
-        print(f"loaded {len(out)} accepted names from {path}", flush=True)
-        return out
-    from extract_ais import build_accepted_names  # noqa: WPS433
+        accepted = _accepted_names_from_payload(payload)
+        if isinstance(payload, dict):
+            extra_allow, extra_names = _mmsi_maps_from_payload(payload)
+            mmsi_allow |= extra_allow
+            mmsi_names.update(extra_names)
+            mmsi_allow |= set(extra_names)
+        source = f"{path} + scripts/config.py"
+    else:
+        try:
+            from extract_ais import build_accepted_names  # noqa: WPS433
+        except ImportError as exc:
+            raise SystemExit(
+                "Pass --accepted-names deploy/accepted_names.json "
+                "(name-only fallback needs FishScraper extract_ais)."
+            ) from exc
+        accepted = build_accepted_names(trips_path)
+        source = f"{trips_path} + scripts/config.py"
+    fleet = FleetFilter(
+        accepted_names=accepted,
+        mmsi_to_report_boat=mmsi_names,
+        mmsi_allowlist=mmsi_allow,
+    )
+    print(
+        f"fleet filter from {source}: {len(accepted)} accepted names, "
+        f"{len(fleet.subscribe_mmsis())} subscribe MMSIs",
+        flush=True,
+    )
+    return fleet
 
-    accepted = build_accepted_names(trips_path)
-    print(f"built {len(accepted)} accepted names from {trips_path}", flush=True)
-    return accepted
+
+def build_subscription(api_key: str, fleet: FleetFilter) -> dict:
+    """SoCal bbox + MMSI allowlist. Never a bbox-only firehose subscription."""
+    mmsis = fleet.subscribe_mmsis()
+    if not mmsis:
+        raise SystemExit(
+            "Refusing to subscribe without FiltersShipMMSI. "
+            "An empty MMSI list would stream every vessel in the SoCal bbox. "
+            "Add MMSIs to deploy/accepted_names.json (mmsi_allowlist / "
+            "mmsi_to_report_boat) and/or scripts/config.py."
+        )
+    return {
+        "APIKey": api_key,
+        "BoundingBoxes": bbox_for_aisstream(),
+        "FiltersShipMMSI": mmsis,
+        "FilterMessageTypes": list(POSITION_MESSAGE_TYPES),
+    }
 
 
-def parse_message(msg: dict, accepted: dict[str, str]) -> dict | None:
+def parse_message(msg: dict, fleet: FleetFilter) -> dict | None:
     meta = msg.get("MetaData") or {}
     mmsi = meta.get("MMSI") or meta.get("Mmsi")
     if mmsi is None:
@@ -178,8 +340,8 @@ def parse_message(msg: dict, accepted: dict[str, str]) -> dict | None:
     )
     name = str(name).strip()
     norm = normalize_name(name) if name else ""
-    report = MMSI_TO_REPORT_BOAT.get(mmsi) or accepted.get(norm)
-    if report is None and mmsi not in MMSI_ALLOWLIST and norm not in accepted:
+    keep, report = fleet.match(mmsi, norm)
+    if not keep:
         return None
 
     sog = pos.get("Sog", pos.get("SOG", meta.get("Sog")))
@@ -270,20 +432,12 @@ def collect(
     api_key: str,
     hours: float,
     flush_every: int,
-    accepted: dict[str, str],
+    fleet: FleetFilter,
     out_dir: Path,
     empty_abort_after_sec: float = EMPTY_ABORT_AFTER_SEC,
 ) -> dict:
-    sub = {
-        "APIKey": api_key,
-        "BoundingBoxes": bbox_for_aisstream(),
-        "FilterMessageTypes": [
-            "PositionReport",
-            "StandardClassBPositionReport",
-            "ExtendedClassBPositionReport",
-            "ShipStaticData",
-        ],
-    }
+    sub = build_subscription(api_key, fleet)
+    n_mmsi = len(sub["FiltersShipMMSI"])
     buffers: dict[str, list[dict]] = defaultdict(list)
     forever = hours <= 0
     started = time.time()
@@ -297,12 +451,14 @@ def collect(
     abort_reason: str | None = None
 
     print(
-        f"Connecting aisstream bbox "
-        f"lat[{AIS_BBOX['min_lat']},{AIS_BBOX['max_lat']}] "
+        "Connecting aisstream vessels-of-interest only "
+        f"FiltersShipMMSI={n_mmsi} "
+        f"bbox lat[{AIS_BBOX['min_lat']},{AIS_BBOX['max_lat']}] "
         f"lon[{AIS_BBOX['min_lon']},{AIS_BBOX['max_lon']}] "
         f"{'forever' if forever else f'for {hours}h'}…",
         flush=True,
     )
+    print("FiltersShipMMSI=" + ",".join(sub["FiltersShipMMSI"]), flush=True)
 
     while not _stop and (forever or time.time() < deadline):
         if (
@@ -358,7 +514,7 @@ def collect(
                         time.sleep(reconnect_delay(reconnect_attempt, saw_rate_limit))
                         reconnect_attempt += 1
                         break
-                    row = parse_message(msg, accepted)
+                    row = parse_message(msg, fleet)
                     if not row:
                         continue
                     buffers[row["date"]].append(row)
@@ -396,12 +552,18 @@ def collect(
                 slept += chunk
 
     flush_day_buffers(buffers, out_dir)
-    print(f"done messages={total} kept={kept}", flush=True)
+    print(f"done messages={total} kept={kept} subscribe_mmsis={n_mmsi}", flush=True)
     days = []
     if out_dir.is_dir():
         for p in sorted(out_dir.glob("ais_*.parquet")):
             days.append(p.name)
-    status, note = classify_collect_status(total, saw_rate_limit, abort_reason)
+    quiet_note = None
+    if kept == 0 and total > 0 and abort_reason is None:
+        quiet_note = (
+            f"Subscribed to {n_mmsi} MMSIs but kept 0 positions "
+            "(no fleet positions in this window)."
+        )
+    status, note = classify_collect_status(total, saw_rate_limit, abort_reason or quiet_note)
     return {
         "messages": total,
         "kept": kept,
@@ -411,6 +573,8 @@ def collect(
         "note": note,
         "rate_limited_hits": rate_limited_hits,
         "elapsed_sec": round(time.time() - started, 1),
+        "subscribe_mmsi_count": n_mmsi,
+        "accepted_name_count": len(fleet.accepted_names),
     }
 
 
@@ -418,9 +582,10 @@ def diagnose(
     api_key: str,
     seconds_per_probe: float = 90.0,
 ) -> dict:
-    """Looser probes: world + SoCal, with/without message-type filters, no MMSI keep filter.
+    """Looser probes: world + SoCal, with/without message-type filters, no MMSI filter.
 
-    Used to separate "our fleet filter is too tight" from "aisstream is silent".
+    Used to separate "the MMSI subscribe list is quiet" from "aisstream is silent".
+    Not used by the scheduled collector — that path always sends FiltersShipMMSI.
     """
     probes = [
         {
@@ -441,12 +606,7 @@ def diagnose(
         {
             "name": "socal_filtered_types",
             "BoundingBoxes": bbox_for_aisstream(),
-            "FilterMessageTypes": [
-                "PositionReport",
-                "StandardClassBPositionReport",
-                "ExtendedClassBPositionReport",
-                "ShipStaticData",
-            ],
+            "FilterMessageTypes": list(POSITION_MESSAGE_TYPES),
         },
     ]
     results = []
@@ -574,7 +734,10 @@ def main() -> None:
         "--accepted-names",
         type=Path,
         default=DEFAULT_ACCEPTED if DEFAULT_ACCEPTED.exists() else None,
-        help="JSON {accepted_names: {NORM: Boat}} (defaults to deploy/aisstream/accepted_names.json)",
+        help=(
+            "JSON with accepted_names, mmsi_allowlist, and mmsi_to_report_boat "
+            "(default: deploy/accepted_names.json). Unioned with scripts/config.py."
+        ),
     )
     ap.add_argument("--out-dir", type=Path, default=Path(os.environ.get("AISSTREAM_OUT_DIR", str(OUT_DIR))))
     ap.add_argument(
@@ -665,7 +828,7 @@ def main() -> None:
             )
         return
 
-    accepted = load_accepted_names(args.accepted_names, args.trips)
+    fleet = load_fleet_filter(args.accepted_names, args.trips)
     if args.empty_abort_after is None:
         empty_abort = EMPTY_ABORT_AFTER_SEC if args.hours > 0 else 0.0
     else:
@@ -674,7 +837,7 @@ def main() -> None:
         args.api_key,
         args.hours,
         args.flush_every,
-        accepted,
+        fleet,
         args.out_dir,
         empty_abort_after_sec=empty_abort,
     )
@@ -690,6 +853,10 @@ def main() -> None:
             rate_limited_hits=stats["rate_limited_hits"],
             elapsed_sec=stats["elapsed_sec"],
             note=stats.get("note"),
+            vessels_of_interest_only=True,
+            subscribe_filter="FiltersShipMMSI",
+            subscribe_mmsi_count=stats["subscribe_mmsi_count"],
+            accepted_name_count=stats["accepted_name_count"],
         )
     if args.fail_if_empty and stats["messages"] <= 0:
         raise SystemExit(
