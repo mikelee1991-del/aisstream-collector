@@ -86,6 +86,8 @@ If FishScraper `scripts/config.py` MMSI maps changed, update this repo's `script
 
 To track a boat that is name-only today, add its 9-digit MMSI to `mmsi_allowlist` / `mmsi_to_report_boat` (and the config maps if you keep those in sync).
 
-## Not for
+## Architecture
 
-Cadastre extract, fish-report scrape, map rebuild — those stay in private FishScraper.
+- Live aisstream websocket collect and Release `aisstream-live`: this repo.
+- Cadastre extract, dock fish-report scrape, and Releases `ais-daily-archive` / `fish-reports-latest`: [fishscraper-ingest](https://github.com/mikelee1991-del/fishscraper-ingest).
+- Map rebuild and the Cloudflare Worker: private FishScraper, which consumes both public repos.
