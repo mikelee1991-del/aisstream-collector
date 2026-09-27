@@ -6,7 +6,7 @@ set -euo pipefail
 LIVE_RELEASE="${LIVE_RELEASE:-aisstream-live}"
 SRC_DIR="${1:-data/processed/ais_live}"
 STATUS_SRC="${2:-docs/data/aisstream_status.json}"
-NOTES="Rolling aisstream.io live shards (fleet + SoCal bbox).
+NOTES="Rolling aisstream.io live shards (vessels of interest only: SoCal bbox + MMSI allowlist).
 Consumed by private mikelee1991-del/FishScraper ingest.
 Do not edit by hand."
 
