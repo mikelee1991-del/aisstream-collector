@@ -1,24 +1,24 @@
 name: aisstream live collect
 
 # Public repo. Single websocket at a time (free aisstream.io rejects
-# overlaps with HTTP 429). Daytime SoCal fishing samples — not a
-# near-continuous collector. Each cron collects SCHEDULE_HOURS (45 min)
-# then exits green. ~3h/day vs the old 5×4h (~20h/day).
+# overlaps with HTTP 429).
 #
-#   13:15 UTC  6:15 AM PDT / 5:15 AM PST  departures
-#   17:15 UTC  10:15 AM PDT / 9:15 AM PST mid-morning
-#   21:15 UTC  2:15 PM PDT / 1:15 PM PST  afternoon
-#   00:15 UTC  5:15 PM PDT / 4:15 PM PST  returns
-#
-# cancel-in-progress still handoffs overlapping dispatch/push sessions.
-# Shards land on Release tag aisstream-live for private FishScraper ingest.
+# Continuous SoCal offshore day, overnight off. GitHub-hosted jobs cap at
+# 6 hours, so the day is three abutting runs (not one 15h job):
+#   12:00 UTC  5:00 AM PDT / 4:00 AM PST  departures, collect 5.25h
+#   17:00 UTC  10:00 AM PDT / 9:00 AM PST mid-morning handoff, collect 5.25h
+#   22:00 UTC  3:00 PM PDT / 2:00 PM PST   afternoon through returns, collect 5h
+# Span when crons are on time: 12:00–03:00 UTC = 5:00 AM–8:00 PM PDT
+# (4:00 AM–7:00 PM PST). The first two runs stay connected 15 minutes past
+# the next cron so a slightly late schedule does not open a hole.
+# cancel-in-progress hands off; the socket drops only for the next runner's
+# checkout and install. Shards land on Release tag aisstream-live.
 
 on:
   schedule:
-    - cron: "15 13 * * *"
-    - cron: "15 17 * * *"
-    - cron: "15 21 * * *"
-    - cron: "15 0 * * *"
+    - cron: "0 12 * * *"
+    - cron: "0 17 * * *"
+    - cron: "0 22 * * *"
   push:
     branches: [main]
     paths:
@@ -37,9 +37,9 @@ on:
   workflow_dispatch:
     inputs:
       hours:
-        description: "Hours to collect (0 = until cancelled / step timeout). Scheduled runs use 0.75."
+        description: "Hours for this run (0 = until cancelled / step timeout). One job cannot cover the whole fishing day (6h runner cap); the schedule uses three abutting runs."
         required: false
-        default: "0.75"
+        default: "5.25"
 
 permissions:
   contents: write
@@ -51,14 +51,16 @@ concurrency:
 env:
   LIVE_RELEASE: aisstream-live
   AISSTREAM_HOST: github-actions-public
-  # 45-minute fishing-day window. Step timeout stays above this so a
-  # SIGTERM can still flush and the always() Release upload can run.
-  SCHEDULE_HOURS: "0.75"
+  # Morning and midday segments. 15 minutes longer than the 5h gap to
+  # the next cron so the socket is still up for the handoff.
+  SCHEDULE_HOURS: "5.25"
+  # 22:00–03:00 UTC. No following cron.
+  SCHEDULE_HOURS_LAST: "5"
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -95,7 +97,7 @@ jobs:
       - name: Collect live AIS
         id: collect
         # Step timeout (not job timeout) so always() upload can still run.
-        timeout-minutes: 70
+        timeout-minutes: 340
         if: ${{ steps.key.outputs.present == 'true' }}
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
@@ -115,9 +117,12 @@ jobs:
             HOURS="${{ github.event.inputs.hours }}"
             HOURS="${HOURS:-0}"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            # Short live smoke so PRs prove collect+upload without a 45min wait.
+            # Short live smoke so PRs prove collect+upload without waiting out a segment.
             HOURS="0.05"
+          elif [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "0 22 * * *" ]; then
+            HOURS="${SCHEDULE_HOURS_LAST}"
           else
+            # schedule (12:00 and 17:00 UTC) and push: one segment.
             HOURS="${SCHEDULE_HOURS}"
           fi
           echo "collect hours=${HOURS} event=${{ github.event_name }}"

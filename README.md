@@ -14,22 +14,26 @@ FishScraper stays **private**. This repo is **public** so the `aisstream.io` web
 
 ## Schedule and Actions minutes
 
-Scheduled runs are four 45-minute samples on the SoCal fishing day (GitHub cron is UTC). They do not run overnight.
+Scheduled collection covers the **whole SoCal offshore day**, from departures through returns, as one continuous span. Overnight at the dock is off.
 
-| UTC cron | PDT (UTC−7) | PST (UTC−8) | What it catches |
+| | PDT (UTC−7) | PST (UTC−8) |
+| --- | --- | --- |
+| Collecting | 5:00 AM – 8:00 PM | 4:00 AM – 7:00 PM |
+| Off (overnight) | 8:00 PM – 5:00 AM | 7:00 PM – 4:00 AM |
+
+GitHub-hosted jobs stop at 6 hours, so that 15-hour span is three abutting runs. The next run is scheduled while the previous one is still connected; `cancel-in-progress` hands off the single socket. The previous run collects 15 minutes past the handoff, so a slightly late cron does not open a hole.
+
+| UTC cron | Collect | PDT | PST |
 | --- | --- | --- | --- |
-| `15 13 * * *` | 6:15–7:00 AM | 5:15–6:00 AM | Harbor departures |
-| `15 17 * * *` | 10:15–11:00 AM | 9:15–10:00 AM | Morning, on the grounds |
-| `15 21 * * *` | 2:15–3:00 PM | 1:15–2:00 PM | Afternoon |
-| `15 0 * * *` | 5:15–6:00 PM | 4:15–5:00 PM | Returns |
+| `0 12 * * *` | 5.25h, hands off at 17:00 UTC | 5:00 AM – 10:00 AM | 4:00 AM – 9:00 AM |
+| `0 17 * * *` | 5.25h, hands off at 22:00 UTC | 10:00 AM – 3:00 PM | 9:00 AM – 2:00 PM |
+| `0 22 * * *` | 5h, through 03:00 UTC | 3:00 PM – 8:00 PM | 2:00 PM – 7:00 PM |
 
-**About 200 runner-minutes per day** (4 × 45 minutes, plus a couple of minutes of setup each run). The previous cron (`15 */5 * * *`, 4 hours each) was **about 1,200 minutes per day**. That is roughly an **80–85%** cut (on the order of **1,000 minutes/day**, or about **30,000 minutes/month**).
+On time, that is **15 hours of collection, about 910 runner-minutes per day** (900 minutes plus a few minutes of setup on each run). The old cron (`15 */5 * * *` × 4 hours, including overnight) was **about 1,200 minutes per day**. Dropping overnight saves **about 300 minutes per day**. The handoff itself is the next runner's checkout and install, a few minutes, and the SIGTERM trap still uploads shards to `aisstream-live` before the old runner exits.
 
-A stuck run is capped at 70 minutes for the collect step and 90 minutes for the job (previously 300 and 360). `cancel-in-progress` is unchanged, so a new run still replaces an overlapping one, and the SIGTERM trap still flushes shards and uploads them to `aisstream-live` before the runner exits.
+Boats already offshore at the start are picked up when the 5:00 AM PDT / 4:00 AM PST run connects. Twilight boats still out after 8:00 PM PDT / 7:00 PM PST are outside this window.
 
-Coverage tradeoff: tracks are four 45-minute slices, not a near-continuous archive. Gaps between windows are about 3–4 hours, and nothing is collected overnight. Boats are usually at the dock then. A multi-day boat is only seen when a window overlaps its trip.
-
-PR runs stay a short smoke test (`hours=0.05`, about 3 minutes) so a pull request can prove collect + upload. **Actions → aisstream live collect → Run workflow** defaults to 0.75 hours. `hours=0` still runs until you cancel it or the 70-minute step timeout fires.
+A stuck run is capped at 340 minutes for the collect step and 360 minutes for the job (the hosted-runner maximum). PR runs stay a short smoke test (`hours=0.05`, about 3 minutes). **Actions → aisstream live collect → Run workflow** defaults to one 5.25-hour segment. `hours=0` runs until you cancel it or the step timeout fires. One manual job cannot hold the full fishing day; that takes the three scheduled runs.
 
 ## Vessels of interest
 

@@ -11,7 +11,7 @@ is in accepted_names. Anything else is dropped and is not written.
 Setup:
   1. Create a free API key at https://aisstream.io/ (GitHub login)
   2. export AISSTREAM_API_KEY=...
-  3. python3 scripts/collect_aisstream.py --hours 0.75
+  3. python3 scripts/collect_aisstream.py --hours 5.25
 
 Primary host is a single GitHub Actions session at a time
 (.github/workflows/aisstream-collect.yml). Overlapping sockets get HTTP 429
