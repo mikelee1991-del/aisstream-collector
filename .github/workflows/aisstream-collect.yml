@@ -8,17 +8,19 @@ name: aisstream live collect
 # earlier one (Oct 25–Nov 12 medians: +6.3h, +4.5h, +3.5h on the old
 # 12:00/17:00/22:00 UTC crons). Five crons, four hours apart, each allowed
 # to collect 5.75h (about 1.75h past the next cron):
-#   05:17 UTC  pre-dawn. A ~6h delay lands near 11:17 UTC, inside the
-#              10:30 UTC pre-roll, so the socket is up at the 12:00 open.
-#   09:17 UTC  covers a 05:17 cron that was only a few hours late and skipped
+#   05:17 UTC  pre-dawn. On time this is before 09:00 UTC and exits.
+#              A ~6h delay lands near 11:17 UTC and it collects.
+#   09:17 UTC  the on-time morning run. 09:00 UTC is open, so this run is
+#              already connected at the 12:00 departure. 5.75h is 345
+#              minutes, inside the 350-minute step (job cap 360).
 #   13:17 UTC  midday handoff
 #   17:17 UTC  afternoon handoff
 #   21:17 UTC  through the 03:00 UTC close (5.75h reaches 03:02 if on time;
 #              the window cap stops it at 03:00)
 # Fishing day: 12:00–03:00 UTC = 5:00 AM–8:00 PM PDT / 4:00 AM–7:00 PM PST.
-# 03:00–10:30 UTC is quiet (no socket). cancel-in-progress hands off the
+# 03:00–09:00 UTC is quiet (no socket). cancel-in-progress hands off the
 # single socket. Shards are flushed every couple of minutes and uploaded
-# with if: always() || cancelled(), under a unique live-<run-id>- name.
+# with if: always(), under a unique live-<run-id>- name.
 # A flat shift of the old three crons cannot cover both ends: the last
 # cron is delayed less than the first, so moving it as far as the morning
 # needs would end the day in the afternoon.
@@ -38,6 +40,8 @@ on:
       - "scripts/config.py"
       - "scripts/upload_live_shards.sh"
       - "scripts/fishing_window.sh"
+      - "scripts/stop_background_uploader.sh"
+      - "scripts/start_background_uploader.sh"
       - "deploy/accepted_names.json"
       - "tests/**"
   pull_request:
@@ -47,6 +51,8 @@ on:
       - "scripts/config.py"
       - "scripts/upload_live_shards.sh"
       - "scripts/fishing_window.sh"
+      - "scripts/stop_background_uploader.sh"
+      - "scripts/start_background_uploader.sh"
       - "deploy/accepted_names.json"
       - "tests/**"
   workflow_dispatch:
@@ -154,26 +160,17 @@ jobs:
           # this step cancelled and starts the always() upload within
           # milliseconds, then orphan-kills python (run 43321010401 uploaded
           # 0 files). Shards already on the release survive that. The loop
-          # stops before the final in-step upload so the two gh calls do
-          # not clobber the same asset at once.
-          uploader_pid=""
-          stop_uploader() {
-            if [ -n "${uploader_pid}" ]; then
-              kill "${uploader_pid}" 2>/dev/null || true
-              wait "${uploader_pid}" 2>/dev/null || true
-              uploader_pid=""
-            fi
-          }
-          (
-            while true; do
-              sleep 180
-              bash scripts/upload_live_shards.sh \
-                data/processed/ais_live \
-                docs/data/aisstream_status.json || true
-            done
-          ) &
-          uploader_pid=$!
-          trap stop_uploader EXIT
+          # is its own session, recorded in uploader.pid, so this step and
+          # the always() step can stop it before either one calls gh.
+          # Otherwise a surviving sleep/gh and the always() step copy the
+          # same shard path and one of them uploads a truncated file.
+          pidfile="data/processed/ais_live/uploader.pid"
+          rm -f "$pidfile"
+          bash scripts/start_background_uploader.sh \
+            "$pidfile" \
+            data/processed/ais_live \
+            docs/data/aisstream_status.json
+          trap 'bash scripts/stop_background_uploader.sh "$pidfile" || true' EXIT
 
           collect_rc=0
           python3 scripts/collect_aisstream.py \
@@ -187,7 +184,7 @@ jobs:
             --status-out docs/data/aisstream_status.json \
             || collect_rc=$?
 
-          stop_uploader
+          bash scripts/stop_background_uploader.sh "$pidfile" || true
           trap - EXIT
 
           if ! bash scripts/upload_live_shards.sh \
@@ -207,15 +204,16 @@ jobs:
           exit "$collect_rc"
 
       - name: Upload live shards to Release
-        # always() runs after failure. cancelled() is what a concurrency
-        # handoff sets; without it a success()-only step would skip the
-        # partial shard. Run 43321010401 reached this step and uploaded 0
-        # files because nothing had been flushed yet.
-        if: ${{ (always() || cancelled()) && steps.key.outputs.present == 'true' && steps.window.outputs.action != 'skip' }}
+        # always() is true on failure and on cancel, so the handoff still
+        # publishes the shard. Run 43321010401 reached this step and uploaded
+        # 0 files because nothing had been flushed yet. Kill a background
+        # uploader the cancelled step left behind before this step calls gh.
+        if: ${{ always() && steps.key.outputs.present == 'true' && steps.window.outputs.action != 'skip' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          bash scripts/stop_background_uploader.sh data/processed/ais_live/uploader.pid || true
           bash scripts/upload_live_shards.sh \
             data/processed/ais_live \
             docs/data/aisstream_status.json

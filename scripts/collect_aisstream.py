@@ -513,8 +513,34 @@ def flush_day_buffers(buffers: dict[str, list[dict]], out_dir: Path, shard_id: s
     return written
 
 
+def file_is_complete_parquet(path: str | Path) -> bool:
+    """True when the file has a parquet header and footer.
+
+    A copy that was truncated mid-upload fails this check and must not be
+    published. FishScraper ingest can then read every live-*.parquet asset.
+    """
+    file = Path(path)
+    try:
+        size = file.stat().st_size
+    except OSError:
+        return False
+    if size < 8:
+        return False
+    with file.open("rb") as fh:
+        head = fh.read(4)
+        if head != b"PAR1":
+            return False
+        fh.seek(size - 4)
+        tail = fh.read(4)
+    return tail == b"PAR1"
+
+
 def write_status(path: Path, **fields) -> dict:
-    """Write docs/data/aisstream_status.json (safe to commit; no secrets)."""
+    """Write docs/data/aisstream_status.json (safe to commit; no secrets).
+
+    The file is replaced atomically so a concurrent uploader copies either
+    the previous complete JSON or the new one.
+    """
     host = os.environ.get("AISSTREAM_HOST")
     if not host:
         host = "github-actions" if os.environ.get("GITHUB_ACTIONS") else "local"
@@ -533,7 +559,9 @@ def write_status(path: Path, **fields) -> dict:
         payload["github_run_url"] = f"{server}/{repo}/actions/runs/{run_id}"
     payload.update(fields)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    os.replace(tmp, path)
     print(f"wrote status {path} status={payload['status']}", flush=True)
     return payload
 
