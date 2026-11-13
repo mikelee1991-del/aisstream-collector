@@ -11,15 +11,17 @@ is in accepted_names. Anything else is dropped and is not written.
 Setup:
   1. Create a free API key at https://aisstream.io/ (GitHub login)
   2. export AISSTREAM_API_KEY=...
-  3. python3 scripts/collect_aisstream.py --hours 5.25
+  3. python3 scripts/collect_aisstream.py --hours 5.75
 
 Primary host is a single GitHub Actions session at a time
 (.github/workflows/aisstream-collect.yml). Overlapping sockets get HTTP 429
 from the free tier, so the workflow cancels the previous run on handoff.
 
-Output is daily parquet (ais_YYYY-MM-DD.parquet) under --out-dir. The
-workflow uses data/processed/ais_live/. The local default is
-data/processed/ais_daily/. Same-day restarts append and dedupe.
+Output is one parquet per UTC day per run under --out-dir
+(ais_YYYY-MM-DD_<run-id>.parquet). The workflow uses
+data/processed/ais_live/ and uploads live-<run-id>-ais_YYYY-MM-DD.parquet.
+Rows are flushed every few minutes and on SIGTERM/SIGINT, not only after
+a 200-message batch, so a cancelled handoff still has a shard on disk.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ from config import (  # noqa: E402
     DATA_PROCESSED,
     DATA_RAW,
     MMSI_ALLOWLIST,
+    MMSI_BLOCKLIST,
     MMSI_TO_REPORT_BOAT,
 )
 
@@ -96,7 +99,7 @@ class FleetFilter:
     mmsi_allowlist: set[int]
 
     def subscribe_mmsis(self) -> list[str]:
-        raw = set(self.mmsi_allowlist) | set(self.mmsi_to_report_boat)
+        raw = (set(self.mmsi_allowlist) | set(self.mmsi_to_report_boat)) - set(MMSI_BLOCKLIST)
         formatted: list[str] = []
         skipped: list[int] = []
         for mmsi in sorted(raw):
@@ -123,6 +126,8 @@ class FleetFilter:
 
     def match(self, mmsi: int, norm: str) -> tuple[bool, str | None]:
         """Return (keep, report boat name). Name may be None for MMSI-only hits."""
+        if mmsi in MMSI_BLOCKLIST:
+            return False, None
         report = self.mmsi_to_report_boat.get(mmsi) or (
             self.accepted_names.get(norm) if norm else None
         )
@@ -152,12 +157,105 @@ RATE_LIMIT_MAX_SEC = 900.0
 EMPTY_ABORT_AFTER_SEC = 20 * 60
 
 _stop = False
+# Buffers for the in-flight session. The signal handler flushes these because
+# a cancelled Actions job only lives about a second after SIGTERM (run
+# 43321010401: always() upload started in 4ms and then orphan-killed python).
+_session: dict = {}
+
+_SHARD_NAME_RE = re.compile(
+    r"^ais_(?P<day>\d{4}-\d{2}-\d{2})(?:_(?P<token>.+))?\.parquet$"
+)
+
+
+def sanitize_shard_id(shard_id: str | None) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]", "_", str(shard_id or "").strip())
+    return token or "local"
+
+
+def default_shard_id() -> str:
+    """One id per Actions run so two handoff runs never share a shard file."""
+    run = os.environ.get("GITHUB_RUN_ID", "").strip()
+    if run:
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "").strip()
+        if attempt and attempt not in {"0", "1"}:
+            return sanitize_shard_id(f"{run}-a{attempt}")
+        return sanitize_shard_id(run)
+    return sanitize_shard_id(f"local-{os.getpid()}")
+
+
+def local_shard_path(out_dir: Path, day: str, shard_id: str) -> Path:
+    return out_dir / f"ais_{day}_{sanitize_shard_id(shard_id)}.parquet"
+
+
+def release_asset_name(local_name: str, run_id: str | None = None) -> str:
+    """Map a local shard to live-<id>-ais_YYYY-MM-DD.parquet.
+
+    FishScraper ingest keeps a day only when the asset name ends with
+    ais_YYYY-MM-DD.parquet. The id is the shard token (the Actions run id),
+    so two runs cannot clobber one release asset. Re-uploading the same
+    run replaces that one asset with the rows accumulated so far.
+    """
+    match = _SHARD_NAME_RE.match(Path(local_name).name)
+    if not match:
+        raise ValueError(f"unrecognized shard name: {local_name}")
+    token = match.group("token") or run_id or "local"
+    return f"live-{sanitize_shard_id(token)}-ais_{match.group('day')}.parquet"
+
+
+def due_for_flush(
+    *,
+    pending: int,
+    kept: int,
+    elapsed_since_flush: float,
+    flush_every: int,
+    flush_seconds: float,
+    count_just_hit: bool,
+) -> bool:
+    """Flush partial rows before a 200-message batch or a clean exit.
+
+    A cancelled run lost every position under the old 200-row rule
+    (run 43321010401 kept 62). Time and a small count both count, and the
+    first kept row is written immediately so a short-lived run still has a file.
+    """
+    if pending <= 0:
+        return False
+    if count_just_hit and kept == 1:
+        return True
+    if flush_seconds > 0 and elapsed_since_flush >= flush_seconds:
+        return True
+    if flush_every > 0 and count_just_hit and kept > 0 and kept % flush_every == 0:
+        return True
+    return False
 
 
 def _handle_stop(signum, frame):  # noqa: ARG001
     global _stop
     _stop = True
-    print(f"received signal {signum}; will flush and exit…", flush=True)
+    print(f"received signal {signum}; flushing and exiting…", flush=True)
+    try:
+        _flush_session(force=True)
+    except Exception as exc:
+        print(f"[warn] flush on signal {signum} failed: {exc}", flush=True)
+
+
+def _flush_session(force: bool = False) -> int:
+    buffers = _session.get("buffers")
+    out_dir = _session.get("out_dir")
+    shard_id = _session.get("shard_id")
+    if buffers is None or out_dir is None or not shard_id:
+        return 0
+    if _session.get("in_flush"):
+        return 0
+    pending = sum(len(rows) for rows in buffers.values())
+    if pending <= 0 or not force:
+        return 0
+    _session["in_flush"] = True
+    try:
+        written = flush_day_buffers(buffers, out_dir, shard_id)
+    finally:
+        _session["in_flush"] = False
+        _session["last_flush"] = time.time()
+    return written
 
 
 def is_rate_limit_error(exc: BaseException) -> bool:
@@ -263,6 +361,9 @@ def load_fleet_filter(path: Path | None, trips_path: Path) -> FleetFilter:
             ) from exc
         accepted = build_accepted_names(trips_path)
         source = f"{trips_path} + scripts/config.py"
+    mmsi_allow -= set(MMSI_BLOCKLIST)
+    for blocked in MMSI_BLOCKLIST:
+        mmsi_names.pop(blocked, None)
     fleet = FleetFilter(
         accepted_names=accepted,
         mmsi_to_report_boat=mmsi_names,
@@ -378,13 +479,20 @@ def parse_message(msg: dict, fleet: FleetFilter) -> dict | None:
     }
 
 
-def flush_day_buffers(buffers: dict[str, list[dict]], out_dir: Path) -> int:
+def flush_day_buffers(buffers: dict[str, list[dict]], out_dir: Path, shard_id: str) -> int:
+    """Append buffered rows onto this run's shard and clear the buffer.
+
+    The file is replaced atomically so an uploader copying it mid-flush
+    reads either the previous complete shard or the new one. The name
+    includes shard_id, so a second run cannot overwrite this file.
+    """
     written = 0
     out_dir.mkdir(parents=True, exist_ok=True)
+    token = sanitize_shard_id(shard_id)
     for day, rows in list(buffers.items()):
         if not rows:
             continue
-        path = out_dir / f"ais_{day}.parquet"
+        path = local_shard_path(out_dir, day, token)
         new_df = pd.DataFrame(rows)
         if path.exists():
             old = pd.read_parquet(path)
@@ -396,15 +504,43 @@ def flush_day_buffers(buffers: dict[str, list[dict]], out_dir: Path) -> int:
             subset=["mmsi", "base_date_time", "latitude", "longitude"],
             keep="last",
         ).sort_values(["mmsi", "base_date_time"])
-        merged.to_parquet(path, index=False)
+        tmp = path.with_name(f".{path.name}.partial")
+        merged.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
         written += len(rows)
         buffers[day] = []
         print(f"flushed {len(rows)} rows -> {path} (total {len(merged)})", flush=True)
     return written
 
 
+def file_is_complete_parquet(path: str | Path) -> bool:
+    """True when the file has a parquet header and footer.
+
+    A copy that was truncated mid-upload fails this check and must not be
+    published. FishScraper ingest can then read every live-*.parquet asset.
+    """
+    file = Path(path)
+    try:
+        size = file.stat().st_size
+    except OSError:
+        return False
+    if size < 8:
+        return False
+    with file.open("rb") as fh:
+        head = fh.read(4)
+        if head != b"PAR1":
+            return False
+        fh.seek(size - 4)
+        tail = fh.read(4)
+    return tail == b"PAR1"
+
+
 def write_status(path: Path, **fields) -> dict:
-    """Write docs/data/aisstream_status.json (safe to commit; no secrets)."""
+    """Write docs/data/aisstream_status.json (safe to commit; no secrets).
+
+    The file is replaced atomically so a concurrent uploader copies either
+    the previous complete JSON or the new one.
+    """
     host = os.environ.get("AISSTREAM_HOST")
     if not host:
         host = "github-actions" if os.environ.get("GITHUB_ACTIONS") else "local"
@@ -423,7 +559,9 @@ def write_status(path: Path, **fields) -> dict:
         payload["github_run_url"] = f"{server}/{repo}/actions/runs/{run_id}"
     payload.update(fields)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    os.replace(tmp, path)
     print(f"wrote status {path} status={payload['status']}", flush=True)
     return payload
 
@@ -435,10 +573,15 @@ def collect(
     fleet: FleetFilter,
     out_dir: Path,
     empty_abort_after_sec: float = EMPTY_ABORT_AFTER_SEC,
+    flush_seconds: float = 120.0,
+    shard_id: str | None = None,
+    status_out: Path | None = None,
 ) -> dict:
+    global _stop
     sub = build_subscription(api_key, fleet)
     n_mmsi = len(sub["FiltersShipMMSI"])
     buffers: dict[str, list[dict]] = defaultdict(list)
+    shard = shard_id or default_shard_id()
     forever = hours <= 0
     started = time.time()
     deadline = None if forever else (started + hours * 3600)
@@ -449,6 +592,46 @@ def collect(
     saw_rate_limit = False
     last_heartbeat = time.time()
     abort_reason: str | None = None
+    _session.clear()
+    _session.update(
+        buffers=buffers,
+        out_dir=out_dir,
+        shard_id=shard,
+        in_flush=False,
+        last_flush=started,
+    )
+    _stop = False
+
+    def persist(count_just_hit: bool = False, force: bool = False) -> None:
+        pending = sum(len(rows) for rows in buffers.values())
+        elapsed = time.time() - float(_session.get("last_flush") or started)
+        if not force and not due_for_flush(
+            pending=pending,
+            kept=kept,
+            elapsed_since_flush=elapsed,
+            flush_every=flush_every,
+            flush_seconds=flush_seconds,
+            count_just_hit=count_just_hit,
+        ):
+            return
+        written = _flush_session(force=True)
+        if written and status_out is not None:
+            partial_status, partial_note = classify_collect_status(total, saw_rate_limit, abort_reason)
+            write_status(
+                status_out,
+                status=partial_status,
+                partial=True,
+                hours=hours,
+                messages=total,
+                kept=kept,
+                shard_id=shard,
+                out_dir=str(out_dir),
+                note=partial_note or "partial flush; run still in progress",
+                vessels_of_interest_only=True,
+                subscribe_filter="FiltersShipMMSI",
+                subscribe_mmsi_count=n_mmsi,
+                accepted_name_count=len(fleet.accepted_names),
+            )
 
     print(
         "Connecting aisstream vessels-of-interest only "
@@ -458,7 +641,16 @@ def collect(
         f"{'forever' if forever else f'for {hours}h'}…",
         flush=True,
     )
-    print("FiltersShipMMSI=" + ",".join(sub["FiltersShipMMSI"]), flush=True)
+    print(
+        "FiltersShipMMSI=" + ",".join(sub["FiltersShipMMSI"])
+        + f" shard={shard} flush_every={flush_every} flush_seconds={flush_seconds}",
+        flush=True,
+    )
+
+    # Short recv timeout so a time-based flush is not stuck behind a 30s read,
+    # and so SIGTERM (which flushes in the handler, then lets recv retry) drops
+    # the socket within a few seconds for the next run's handoff.
+    recv_timeout = 5.0
 
     while not _stop and (forever or time.time() < deadline):
         if (
@@ -478,8 +670,9 @@ def collect(
                 print("subscribed", flush=True)
                 while not _stop and (forever or time.time() < deadline):
                     try:
-                        raw = ws.recv(timeout=30)
+                        raw = ws.recv(timeout=recv_timeout)
                     except TimeoutError:
+                        persist()
                         if time.time() - last_heartbeat >= 300:
                             print(
                                 f"heartbeat messages={total} kept={kept} "
@@ -497,6 +690,11 @@ def collect(
                                 f"{int(empty_abort_after_sec)}s; aborting empty session early"
                             )
                             print(f"[error] {abort_reason}", flush=True)
+                            break
+                        continue
+                    except InterruptedError:
+                        persist(force=True)
+                        if _stop:
                             break
                         continue
                     total += 1
@@ -519,12 +717,10 @@ def collect(
                         continue
                     buffers[row["date"]].append(row)
                     kept += 1
-                    if kept % flush_every == 0:
-                        flush_day_buffers(buffers, out_dir)
+                    persist(count_just_hit=True)
+                    count_boundary = flush_every > 0 and kept % flush_every == 0
+                    if count_boundary or time.time() - last_heartbeat >= 300:
                         print(f"progress messages={total} kept={kept}", flush=True)
-                        last_heartbeat = time.time()
-                    elif time.time() - last_heartbeat >= 300:
-                        print(f"heartbeat messages={total} kept={kept}", flush=True)
                         last_heartbeat = time.time()
                 else:
                     # inner while exhausted without break
@@ -542,7 +738,7 @@ def collect(
                 f"{' (rate limit)' if rate_limited else ''}",
                 flush=True,
             )
-            flush_day_buffers(buffers, out_dir)
+            persist(force=True)
             reconnect_attempt += 1
             # Sleep in chunks so SIGTERM can land quickly during long 429 backoff.
             slept = 0.0
@@ -551,8 +747,12 @@ def collect(
                 time.sleep(chunk)
                 slept += chunk
 
-    flush_day_buffers(buffers, out_dir)
-    print(f"done messages={total} kept={kept} subscribe_mmsis={n_mmsi}", flush=True)
+    persist(force=True)
+    _session.clear()
+    print(
+        f"done messages={total} kept={kept} subscribe_mmsis={n_mmsi} shard={shard}",
+        flush=True,
+    )
     days = []
     if out_dir.is_dir():
         for p in sorted(out_dir.glob("ais_*.parquet")):
@@ -575,6 +775,7 @@ def collect(
         "elapsed_sec": round(time.time() - started, 1),
         "subscribe_mmsi_count": n_mmsi,
         "accepted_name_count": len(fleet.accepted_names),
+        "shard_id": shard,
     }
 
 
@@ -728,7 +929,23 @@ def main() -> None:
         default=0.0,
         help="How long to collect (0 = forever / daemon mode until signal)",
     )
-    ap.add_argument("--flush-every", type=int, default=200)
+    ap.add_argument(
+        "--flush-every",
+        type=int,
+        default=20,
+        help="Also flush after this many kept rows (0 disables the count trigger)",
+    )
+    ap.add_argument(
+        "--flush-seconds",
+        type=float,
+        default=120.0,
+        help="Flush pending rows at least this often, so a cancel still has a shard (0 disables)",
+    )
+    ap.add_argument(
+        "--shard-id",
+        default=None,
+        help="Unique shard token (default: GITHUB_RUN_ID, else local-<pid>)",
+    )
     ap.add_argument("--trips", type=Path, default=DATA_RAW / "fish_reports" / "by_year")
     ap.add_argument(
         "--accepted-names",
@@ -840,6 +1057,9 @@ def main() -> None:
         fleet,
         args.out_dir,
         empty_abort_after_sec=empty_abort,
+        flush_seconds=args.flush_seconds,
+        shard_id=args.shard_id,
+        status_out=args.status_out,
     )
     if args.status_out:
         write_status(
@@ -857,6 +1077,8 @@ def main() -> None:
             subscribe_filter="FiltersShipMMSI",
             subscribe_mmsi_count=stats["subscribe_mmsi_count"],
             accepted_name_count=stats["accepted_name_count"],
+            shard_id=stats.get("shard_id"),
+            partial=False,
         )
     if args.fail_if_empty and stats["messages"] <= 0:
         raise SystemExit(

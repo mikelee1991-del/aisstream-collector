@@ -3,22 +3,35 @@ name: aisstream live collect
 # Public repo. Single websocket at a time (free aisstream.io rejects
 # overlaps with HTTP 429).
 #
-# Continuous SoCal offshore day, overnight off. GitHub-hosted jobs cap at
-# 6 hours, so the day is three abutting runs (not one 15h job):
-#   12:00 UTC  5:00 AM PDT / 4:00 AM PST  departures, collect 5.25h
-#   17:00 UTC  10:00 AM PDT / 9:00 AM PST mid-morning handoff, collect 5.25h
-#   22:00 UTC  3:00 PM PDT / 2:00 PM PST   afternoon through returns, collect 5h
-# Span when crons are on time: 12:00–03:00 UTC = 5:00 AM–8:00 PM PDT
-# (4:00 AM–7:00 PM PST). The first two runs stay connected 15 minutes past
-# the next cron so a slightly late schedule does not open a hole.
-# cancel-in-progress hands off; the socket drops only for the next runner's
-# checkout and install. Shards land on Release tag aisstream-live.
+# GitHub-hosted jobs cap at 6 hours. Since late August 2026 the schedule
+# on this repo starts hours late, and a later cron is delayed less than an
+# earlier one (Oct 25–Nov 12 medians: +6.3h, +4.5h, +3.5h on the old
+# 12:00/17:00/22:00 UTC crons). Five crons, four hours apart, each allowed
+# to collect 5.75h (about 1.75h past the next cron):
+#   05:17 UTC  pre-dawn. On time this is before 09:00 UTC and exits.
+#              A ~6h delay lands near 11:17 UTC and it collects.
+#   09:17 UTC  the on-time morning run. 09:00 UTC is open, so this run is
+#              already connected at the 12:00 departure. 5.75h is 345
+#              minutes, inside the 350-minute step (job cap 360).
+#   13:17 UTC  midday handoff
+#   17:17 UTC  afternoon handoff
+#   21:17 UTC  through the 03:00 UTC close (5.75h reaches 03:02 if on time;
+#              the window cap stops it at 03:00)
+# Fishing day: 12:00–03:00 UTC = 5:00 AM–8:00 PM PDT / 4:00 AM–7:00 PM PST.
+# 03:00–09:00 UTC is quiet (no socket). cancel-in-progress hands off the
+# single socket. Shards are flushed every couple of minutes and uploaded
+# with if: always(), under a unique live-<run-id>- name.
+# A flat shift of the old three crons cannot cover both ends: the last
+# cron is delayed less than the first, so moving it as far as the morning
+# needs would end the day in the afternoon.
 
 on:
   schedule:
-    - cron: "0 12 * * *"
-    - cron: "0 17 * * *"
-    - cron: "0 22 * * *"
+    - cron: "17 5 * * *"
+    - cron: "17 9 * * *"
+    - cron: "17 13 * * *"
+    - cron: "17 17 * * *"
+    - cron: "17 21 * * *"
   push:
     branches: [main]
     paths:
@@ -26,20 +39,28 @@ on:
       - "scripts/collect_aisstream.py"
       - "scripts/config.py"
       - "scripts/upload_live_shards.sh"
+      - "scripts/fishing_window.sh"
+      - "scripts/stop_background_uploader.sh"
+      - "scripts/start_background_uploader.sh"
       - "deploy/accepted_names.json"
+      - "tests/**"
   pull_request:
     paths:
       - ".github/workflows/aisstream-collect.yml"
       - "scripts/collect_aisstream.py"
       - "scripts/config.py"
       - "scripts/upload_live_shards.sh"
+      - "scripts/fishing_window.sh"
+      - "scripts/stop_background_uploader.sh"
+      - "scripts/start_background_uploader.sh"
       - "deploy/accepted_names.json"
+      - "tests/**"
   workflow_dispatch:
     inputs:
       hours:
-        description: "Hours for this run (0 = until cancelled / step timeout). One job cannot cover the whole fishing day (6h runner cap); the schedule uses three abutting runs."
+        description: "Hours for this run (0 = until cancelled / step timeout). One job cannot cover the whole fishing day (6h runner cap); the schedule uses five overlapping runs."
         required: false
-        default: "5.25"
+        default: "5.75"
 
 permissions:
   contents: write
@@ -51,11 +72,10 @@ concurrency:
 env:
   LIVE_RELEASE: aisstream-live
   AISSTREAM_HOST: github-actions-public
-  # Morning and midday segments. 15 minutes longer than the 5h gap to
-  # the next cron so the socket is still up for the handoff.
-  SCHEDULE_HOURS: "5.25"
-  # 22:00–03:00 UTC. No following cron.
-  SCHEDULE_HOURS_LAST: "5"
+  # 1.75h longer than the 4h cron gap, and long enough that an on-time
+  # 21:17 UTC run reaches the 03:00 UTC close. The fishing-window cap
+  # trims whatever would run past 03:00.
+  SCHEDULE_HOURS: "5.75"
 
 jobs:
   collect:
@@ -82,62 +102,90 @@ jobs:
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Fishing window
+        id: window
+        if: ${{ github.event_name == 'schedule' }}
+        run: |
+          set -euo pipefail
+          read -r action hours <<<"$(bash scripts/fishing_window.sh "${SCHEDULE_HOURS}")"
+          echo "action=${action}" >> "$GITHUB_OUTPUT"
+          echo "hours=${hours}" >> "$GITHUB_OUTPUT"
+          echo "fishing window: ${action} ${hours:-}"
+
       - name: Set up Python
-        if: ${{ steps.key.outputs.present == 'true' }}
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' || (steps.key.outputs.present == 'true' && (github.event_name != 'schedule' || steps.window.outputs.action == 'collect')) }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install collector dependencies
-        if: ${{ steps.key.outputs.present == 'true' }}
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' || (steps.key.outputs.present == 'true' && (github.event_name != 'schedule' || steps.window.outputs.action == 'collect')) }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Unit tests
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+        run: python -m unittest discover -s tests -v
+
       - name: Collect live AIS
         id: collect
         # Step timeout (not job timeout) so always() upload can still run.
-        timeout-minutes: 340
-        if: ${{ steps.key.outputs.present == 'true' }}
+        # 350 leaves about 10 minutes of the 360-minute job for that upload
+        # if the collect step itself is killed at the cap.
+        timeout-minutes: 350
+        if: ${{ steps.key.outputs.present == 'true' && (github.event_name != 'schedule' || steps.window.outputs.action == 'collect') }}
         env:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # GitHub SIGTERMs the process group on cancel/preempt. Trap it in
-          # bash so we survive long enough for Python to flush and for us to
-          # upload. Run 34336864840 flushed 205 rows then skipped always()
-          # upload, concluding failure and emailing "Run failed".
-          on_term() {
-            echo "step received SIGTERM; waiting for collector flush + upload…"
-          }
-          trap on_term TERM INT
-
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             HOURS="${{ github.event.inputs.hours }}"
             HOURS="${HOURS:-0}"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
             # Short live smoke so PRs prove collect+upload without waiting out a segment.
             HOURS="0.05"
-          elif [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.schedule }}" = "0 22 * * *" ]; then
-            HOURS="${SCHEDULE_HOURS_LAST}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            HOURS="${{ steps.window.outputs.hours }}"
           else
-            # schedule (12:00 and 17:00 UTC) and push: one segment.
+            # push: one segment, any time of day.
             HOURS="${SCHEDULE_HOURS}"
           fi
           echo "collect hours=${HOURS} event=${{ github.event_name }}"
 
           mkdir -p data/processed/ais_live docs/data
+
+          # Upload while python is still running. A concurrency cancel marks
+          # this step cancelled and starts the always() upload within
+          # milliseconds, then orphan-kills python (run 43321010401 uploaded
+          # 0 files). Shards already on the release survive that. The loop
+          # is its own session, recorded in uploader.pid, so this step and
+          # the always() step can stop it before either one calls gh.
+          # Otherwise a surviving sleep/gh and the always() step copy the
+          # same shard path and one of them uploads a truncated file.
+          pidfile="data/processed/ais_live/uploader.pid"
+          rm -f "$pidfile"
+          bash scripts/start_background_uploader.sh \
+            "$pidfile" \
+            data/processed/ais_live \
+            docs/data/aisstream_status.json
+          trap 'bash scripts/stop_background_uploader.sh "$pidfile" || true' EXIT
+
           collect_rc=0
           python3 scripts/collect_aisstream.py \
             --hours "$HOURS" \
-            --flush-every 200 \
+            --flush-every 20 \
+            --flush-seconds 120 \
             --fail-if-empty \
             --empty-abort-after 1200 \
             --accepted-names deploy/accepted_names.json \
             --out-dir data/processed/ais_live \
             --status-out docs/data/aisstream_status.json \
             || collect_rc=$?
+
+          bash scripts/stop_background_uploader.sh "$pidfile" || true
+          trap - EXIT
 
           if ! bash scripts/upload_live_shards.sh \
             data/processed/ais_live \
@@ -156,11 +204,16 @@ jobs:
           exit "$collect_rc"
 
       - name: Upload live shards to Release
-        if: ${{ always() && steps.key.outputs.present == 'true' }}
+        # always() is true on failure and on cancel, so the handoff still
+        # publishes the shard. Run 43321010401 reached this step and uploaded
+        # 0 files because nothing had been flushed yet. Kill a background
+        # uploader the cancelled step left behind before this step calls gh.
+        if: ${{ always() && steps.key.outputs.present == 'true' && steps.window.outputs.action != 'skip' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          bash scripts/stop_background_uploader.sh data/processed/ais_live/uploader.pid || true
           bash scripts/upload_live_shards.sh \
             data/processed/ais_live \
             docs/data/aisstream_status.json

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import collect_aisstream as collector  # noqa: E402
-from config import MMSI_ALLOWLIST, MMSI_TO_REPORT_BOAT  # noqa: E402
+from config import MMSI_ALLOWLIST, MMSI_BLOCKLIST, MMSI_TO_REPORT_BOAT  # noqa: E402
 
 
 def _position(mmsi: int, name: str, lat: float = 33.75, lon: float = -118.25) -> dict:
@@ -51,8 +51,15 @@ class FleetFilterTests(unittest.TestCase):
             | set(MMSI_TO_REPORT_BOAT)
             | {int(m) for m in payload["mmsi_allowlist"]}
             | {int(k) for k in payload["mmsi_to_report_boat"]}
-        )
+        ) - set(MMSI_BLOCKLIST)
         self.assertEqual(set(mmsis), {str(m) for m in expected})
+        # Newport sailboat Spitfire, and the tow wrongly tied to San Pedro's Pride.
+        self.assertNotIn(368269920, MMSI_ALLOWLIST)
+        self.assertNotIn(368269920, MMSI_TO_REPORT_BOAT)
+        self.assertNotIn(366341000, MMSI_ALLOWLIST)
+        self.assertNotIn(366341000, MMSI_TO_REPORT_BOAT)
+        self.assertNotIn("368269920", mmsis)
+        self.assertNotIn("366341000", mmsis)
         # Config-only (not in the JSON MMSI list) and JSON-listed boats both subscribe.
         self.assertIn("367175860", mmsis)  # Independence
         self.assertIn("338068929", mmsis)  # Dreamer
@@ -77,6 +84,26 @@ class FleetFilterTests(unittest.TestCase):
         sub = collector.build_subscription("secret", fleet)
         self.assertIn("367000111", sub["FiltersShipMMSI"])
         self.assertNotIn("secret", sub["FiltersShipMMSI"])
+
+    def test_blocked_mmsi_in_json_is_not_subscribed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "accepted_names.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "accepted_names": {"SPITFIRE": "Spitfire"},
+                        "mmsi_allowlist": [368269920, 366341000],
+                        "mmsi_to_report_boat": {"368269920": "Spitfire"},
+                    }
+                )
+            )
+            fleet = collector.load_fleet_filter(path, Path("unused"))
+        self.assertNotIn(368269920, fleet.mmsi_allowlist)
+        self.assertNotIn(366341000, fleet.mmsi_allowlist)
+        self.assertNotIn(368269920, fleet.mmsi_to_report_boat)
+        sub = collector.build_subscription("test-key", fleet)
+        self.assertNotIn("368269920", sub["FiltersShipMMSI"])
+        self.assertNotIn("366341000", sub["FiltersShipMMSI"])
 
     def test_refuses_bbox_only_subscription(self) -> None:
         fleet = collector.FleetFilter(
@@ -121,6 +148,15 @@ class FleetFilterTests(unittest.TestCase):
         self.assertEqual(by_name["report_boat_name"], "Aggressor")
 
         self.assertIsNone(collector.parse_message(_position(999999991, "MAERSK DENVER"), fleet))
+        # Blocked MMSIs stay out even when the AIS name is on the accepted list.
+        blocked = collector.FleetFilter(
+            accepted_names={"SPITFIRE": "Spitfire", "PRIDE": "Pride"},
+            mmsi_to_report_boat={368269920: "Spitfire", 366341000: "Pride"},
+            mmsi_allowlist={368269920, 366341000},
+        )
+        self.assertEqual(blocked.subscribe_mmsis(), [])
+        self.assertIsNone(collector.parse_message(_position(368269920, "SPITFIRE"), blocked))
+        self.assertIsNone(collector.parse_message(_position(366341000, "PRIDE"), blocked))
         self.assertIsNone(
             collector.parse_message(_position(366855060, "New Del Mar", lat=20.0, lon=-118.25), fleet)
         )

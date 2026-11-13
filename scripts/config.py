@@ -40,10 +40,17 @@ MMSI_ALLOWLIST = {
     367169120,
     368078070,
     366915000,
-    368269920,
     366849310,
     367175860,
     367576030,
+}
+
+# Never subscribe or record these, even if a FishScraper export still lists them.
+# 368269920 is a Newport Harbor sailboat, not the MDR sportfishing Spitfire.
+# 366341000 is a towing vessel wrongly linked to San Pedro's Pride.
+MMSI_BLOCKLIST = {
+    368269920,
+    366341000,
 }
 
 MMSI_TO_REPORT_BOAT = {
@@ -62,7 +69,6 @@ MMSI_TO_REPORT_BOAT = {
     367169120: "Toronado",
     368078070: "Thunderbird",
     366915000: "El Patron",
-    368269920: "Spitfire",
     366849310: "Dana Pride",
     368370000: "Apollo",
     338068929: "Dreamer",
